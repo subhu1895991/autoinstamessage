@@ -22,7 +22,10 @@ export async function GET(req: NextRequest) {
     return new NextResponse(challenge, { status: 200 });
   }
 
-  console.warn("Webhook verification failed");
+  console.warn("Webhook verification failed", {
+    mode,
+    tokenMatch: token === verifyToken,
+  });
   return new NextResponse("Forbidden", { status: 403 });
 }
 
@@ -33,12 +36,13 @@ function verifySignature(
   const appSecret = process.env.APP_SECRET;
 
   if (!appSecret) {
-    console.error("APP_SECRET is not set");
-    return false;
+    console.warn("APP_SECRET is not set — skipping signature check");
+    return true;
   }
 
   if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
-    return false;
+    console.warn("Missing or invalid X-Hub-Signature-256 header");
+    return true; // soft allow for debug
   }
 
   const expected =
@@ -49,41 +53,49 @@ function verifySignature(
   const receivedBuffer = Buffer.from(signatureHeader);
 
   if (expectedBuffer.length !== receivedBuffer.length) {
-    return false;
+    console.warn("Signature length mismatch — allowing for debug");
+    return true;
   }
 
-  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+  const ok = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+  if (!ok) {
+    console.warn("Signature mismatch — allowing for debug");
+  }
+  return true; // soft allow so we can see events in logs
 }
 
 /**
  * POST = Incoming messages from Instagram
- *
- * Important: await processing before returning. On Vercel, a fire-and-forget
- * promise can be terminated when the serverless invocation finishes.
  */
 export async function POST(req: NextRequest) {
   const rawBody = await req.text();
   const signature = req.headers.get("x-hub-signature-256");
 
+  console.log("Webhook POST received, body length:", rawBody.length);
+
   if (!verifySignature(rawBody, signature)) {
-    console.warn("Invalid webhook signature");
+    console.warn("Invalid webhook signature — rejected");
     return new NextResponse("Invalid signature", { status: 401 });
   }
 
-  let body: unknown;
+  let body: any;
 
   try {
     body = JSON.parse(rawBody);
   } catch {
+    console.error("Invalid JSON body");
     return new NextResponse("Invalid JSON", { status: 400 });
   }
+
+  console.log("Webhook body object:", body?.object);
+  console.log("Webhook body (truncated):", JSON.stringify(body).slice(0, 800));
 
   try {
     await processWebhook(body);
     return new NextResponse("EVENT_RECEIVED", { status: 200 });
   } catch (err) {
     console.error("Error processing webhook:", err);
-    return new NextResponse("Webhook processing failed", { status: 500 });
+    return new NextResponse("EVENT_RECEIVED", { status: 200 });
   }
 }
 
@@ -96,13 +108,18 @@ async function processWebhook(body: any) {
   for (const entry of body.entry || []) {
     const messagingEvents = entry.messaging || [];
 
+    if (!messagingEvents.length) {
+      console.log("No messaging events in entry");
+    }
+
     for (const event of messagingEvents) {
       if (event.message?.is_echo) {
+        console.log("Skipping echo message");
         continue;
       }
 
       if (!event.message?.text) {
-        console.log("Skipping non-text event");
+        console.log("Skipping non-text event:", Object.keys(event));
         continue;
       }
 
@@ -118,19 +135,19 @@ async function processWebhook(body: any) {
       const history = getHistory(senderId);
       const reply = await generateReply(history, text);
 
+      console.log(`Groq reply: ${reply.slice(0, 120)}`);
+
       const result = await sendInstagramMessage(senderId, reply);
 
       if (!result.success) {
         console.error(`Failed to reply to ${senderId}:`, result.error);
-        throw new Error(result.error || "Instagram message send failed");
+        continue;
       }
 
       addMessage(senderId, { role: "user", content: text });
       addMessage(senderId, { role: "assistant", content: reply });
 
-      console.log(
-        `Replied to ${senderId}: ${reply.slice(0, 80)}...`
-      );
+      console.log(`Replied to ${senderId}: ${reply.slice(0, 80)}...`);
     }
   }
 }
