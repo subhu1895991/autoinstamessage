@@ -4,6 +4,8 @@ import { addMessage, getHistory } from "@/lib/store";
 import { generateReply } from "@/lib/groq";
 import { sendInstagramMessage } from "@/lib/instagram";
 
+export const runtime = "nodejs";
+
 /**
  * GET = Webhook verification (Meta sends this when you set the Callback URL)
  */
@@ -15,7 +17,7 @@ export async function GET(req: NextRequest) {
 
   const verifyToken = process.env.VERIFY_TOKEN;
 
-  if (mode === "subscribe" && token === verifyToken) {
+  if (mode === "subscribe" && token === verifyToken && challenge) {
     console.log("Webhook verified successfully");
     return new NextResponse(challenge, { status: 200 });
   }
@@ -24,14 +26,15 @@ export async function GET(req: NextRequest) {
   return new NextResponse("Forbidden", { status: 403 });
 }
 
-/**
- * Optional: verify X-Hub-Signature-256 from Meta
- */
-function verifySignature(rawBody: string, signatureHeader: string | null): boolean {
+function verifySignature(
+  rawBody: string,
+  signatureHeader: string | null
+): boolean {
   const appSecret = process.env.APP_SECRET;
+
   if (!appSecret) {
-    // If no secret configured, skip signature check (not recommended for production)
-    return true;
+    console.error("APP_SECRET is not set");
+    return false;
   }
 
   if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
@@ -42,18 +45,21 @@ function verifySignature(rawBody: string, signatureHeader: string | null): boole
     "sha256=" +
     crypto.createHmac("sha256", appSecret).update(rawBody).digest("hex");
 
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(expected),
-      Buffer.from(signatureHeader)
-    );
-  } catch {
+  const expectedBuffer = Buffer.from(expected);
+  const receivedBuffer = Buffer.from(signatureHeader);
+
+  if (expectedBuffer.length !== receivedBuffer.length) {
     return false;
   }
+
+  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 }
 
 /**
  * POST = Incoming messages from Instagram
+ *
+ * Important: await processing before returning. On Vercel, a fire-and-forget
+ * promise can be terminated when the serverless invocation finishes.
  */
 export async function POST(req: NextRequest) {
   const rawBody = await req.text();
@@ -64,25 +70,24 @@ export async function POST(req: NextRequest) {
     return new NextResponse("Invalid signature", { status: 401 });
   }
 
-  let body: any;
+  let body: unknown;
+
   try {
     body = JSON.parse(rawBody);
   } catch {
     return new NextResponse("Invalid JSON", { status: 400 });
   }
 
-  // Always respond 200 quickly so Meta doesn't retry
-  // Process asynchronously (fire-and-forget style)
-  processWebhook(body).catch((err) =>
-    console.error("Error processing webhook:", err)
-  );
-
-  return new NextResponse("EVENT_RECEIVED", { status: 200 });
+  try {
+    await processWebhook(body);
+    return new NextResponse("EVENT_RECEIVED", { status: 200 });
+  } catch (err) {
+    console.error("Error processing webhook:", err);
+    return new NextResponse("Webhook processing failed", { status: 500 });
+  }
 }
 
 async function processWebhook(body: any) {
-  // Instagram webhooks use object: "instagram"
-  // (sometimes also "page" depending on setup)
   if (body.object !== "instagram" && body.object !== "page") {
     console.log("Ignoring non-instagram/page object:", body.object);
     return;
@@ -92,14 +97,11 @@ async function processWebhook(body: any) {
     const messagingEvents = entry.messaging || [];
 
     for (const event of messagingEvents) {
-      // Ignore echoes (messages we ourselves sent)
       if (event.message?.is_echo) {
         continue;
       }
 
-      // Only handle text messages for now
       if (!event.message?.text) {
-        // Could be attachment, reaction, read receipt, etc.
         console.log("Skipping non-text event");
         continue;
       }
@@ -107,28 +109,28 @@ async function processWebhook(body: any) {
       const senderId = event.sender?.id;
       const text = event.message.text.trim();
 
-      if (!senderId || !text) continue;
+      if (!senderId || !text) {
+        continue;
+      }
 
       console.log(`Message from ${senderId}: ${text}`);
 
-      // 1. Load previous history
       const history = getHistory(senderId);
-
-      // 2. Generate AI reply with last ~10 messages as context
       const reply = await generateReply(history, text);
 
-      // 3. Store both the user message and our reply
+      const result = await sendInstagramMessage(senderId, reply);
+
+      if (!result.success) {
+        console.error(`Failed to reply to ${senderId}:`, result.error);
+        throw new Error(result.error || "Instagram message send failed");
+      }
+
       addMessage(senderId, { role: "user", content: text });
       addMessage(senderId, { role: "assistant", content: reply });
 
-      // 4. Send the reply back to Instagram
-      const result = await sendInstagramMessage(senderId, reply);
-
-      if (result.success) {
-        console.log(`Replied to ${senderId}: ${reply.slice(0, 80)}...`);
-      } else {
-        console.error(`Failed to reply to ${senderId}:`, result.error);
-      }
+      console.log(
+        `Replied to ${senderId}: ${reply.slice(0, 80)}...`
+      );
     }
   }
 }
