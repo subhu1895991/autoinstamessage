@@ -28,8 +28,6 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 IG_SESSION_JSON = os.getenv("IG_SESSION_JSON", "").strip()
 SESSION_ONLY = os.getenv("SESSION_ONLY", "1").strip() in ("1", "true", "True", "yes")
 PORT = int(os.getenv("PORT", "10000"))
-# After we reply in a thread, ignore that thread until a NEWER user message arrives
-# (tracked by last replied message id)
 
 SESSION_FILE = Path("session.json")
 REPLIED_FILE = Path("replied.json")
@@ -44,8 +42,9 @@ SYSTEM_PROMPT = (
 groq_client = Groq(api_key=GROQ_API_KEY)
 _in_flight: set = set()
 _status = {"ok": False, "msg": "starting"}
-# thread_id -> last message id we already handled
 _thread_last_handled: dict = {}
+# Our Instagram user id as string (set after login)
+MY_USER_ID = ""
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -98,7 +97,50 @@ def ensure_session_file() -> bool:
     return SESSION_FILE.exists()
 
 
+def resolve_my_user_id(cl: Client, settings: dict) -> str:
+    """Get our user id without assigning to cl.user_id (read-only in some versions)."""
+    global MY_USER_ID
+
+    # 1) From client after successful login
+    try:
+        if getattr(cl, "user_id", None):
+            MY_USER_ID = str(cl.user_id)
+            return MY_USER_ID
+    except Exception:
+        pass
+
+    # 2) From session settings
+    for key in ("ds_user_id", "user_id"):
+        if settings.get(key):
+            MY_USER_ID = str(settings[key])
+            return MY_USER_ID
+
+    auth = settings.get("authorization_data") or {}
+    if auth.get("ds_user_id"):
+        MY_USER_ID = str(auth["ds_user_id"])
+        return MY_USER_ID
+
+    # 3) From account_info API
+    try:
+        info = cl.account_info()
+        MY_USER_ID = str(info.pk)
+        return MY_USER_ID
+    except Exception as e:
+        print(f"account_info failed: {e}")
+
+    # 4) From username lookup
+    try:
+        uid = cl.user_id_from_username(IG_USERNAME)
+        MY_USER_ID = str(uid)
+        return MY_USER_ID
+    except Exception as e:
+        print(f"user_id_from_username failed: {e}")
+
+    return ""
+
+
 def login_client() -> Client:
+    global MY_USER_ID
     has_session = ensure_session_file()
     cl = Client()
     cl.delay_range = [2, 5]
@@ -106,7 +148,10 @@ def login_client() -> Client:
     if has_session and SESSION_FILE.exists():
         try:
             cl.load_settings(SESSION_FILE)
-            cl.username = IG_USERNAME
+            try:
+                cl.username = IG_USERNAME
+            except Exception:
+                pass
 
             settings = {}
             try:
@@ -114,18 +159,7 @@ def login_client() -> Client:
             except Exception:
                 pass
 
-            # Critical: set user_id so we can detect our own messages
-            uid = settings.get("ds_user_id") or settings.get("user_id")
-            if not uid:
-                auth = settings.get("authorization_data") or {}
-                uid = auth.get("ds_user_id")
-            if uid:
-                cl.user_id = int(uid)
-                print(f"Set user_id from session: {cl.user_id}")
-
-            sessionid = None
-            cookies = settings.get("cookies") or {}
-            sessionid = cookies.get("sessionid")
+            sessionid = (settings.get("cookies") or {}).get("sessionid")
 
             if sessionid:
                 cl.login_by_sessionid(sessionid)
@@ -134,19 +168,12 @@ def login_client() -> Client:
                 cl.get_timeline_feed()
                 print("Logged in with saved settings")
 
-            # Re-read user_id after login if still missing
-            if not cl.user_id:
-                try:
-                    info = cl.account_info()
-                    cl.user_id = int(info.pk)
-                    print(f"Set user_id from account_info: {cl.user_id}")
-                except Exception as e:
-                    print(f"Could not get account_info: {e}")
+            my_id = resolve_my_user_id(cl, settings)
+            if not my_id:
+                raise RuntimeError("Could not resolve user_id — unsafe to run (would spam)")
 
-            if not cl.user_id:
-                raise RuntimeError("user_id is missing — cannot safely detect own messages")
-
-            _status.update({"ok": True, "msg": "logged_in", "user_id": cl.user_id})
+            print(f"My user_id: {my_id}")
+            _status.update({"ok": True, "msg": "logged_in", "user_id": my_id})
             return cl
         except Exception as e:
             print(f"Session login failed: {e}")
@@ -177,8 +204,9 @@ def login_client() -> Client:
         raise
 
     cl.dump_settings(SESSION_FILE)
-    print("Fresh login successful, session saved")
-    _status.update({"ok": True, "msg": "logged_in_password", "user_id": cl.user_id})
+    my_id = resolve_my_user_id(cl, {})
+    print(f"Fresh login successful, user_id={my_id}")
+    _status.update({"ok": True, "msg": "logged_in_password", "user_id": my_id})
     return cl
 
 
@@ -206,7 +234,7 @@ def get_thread_history(cl: Client, thread_id: str) -> list:
         for m in reversed(thread.messages or []):
             if not m.text:
                 continue
-            role = "assistant" if str(m.user_id) == str(cl.user_id) else "user"
+            role = "assistant" if str(m.user_id) == MY_USER_ID else "user"
             messages.append({"role": role, "content": m.text})
         return messages
     except Exception as e:
@@ -224,9 +252,8 @@ def process_inbox(cl: Client, replied: set) -> None:
         print(f"Error fetching threads: {e}")
         return
 
-    my_id = str(cl.user_id)
-    if not my_id or my_id == "None":
-        print("ERROR: my_id is invalid — skipping cycle to avoid spam")
+    if not MY_USER_ID:
+        print("ERROR: MY_USER_ID empty — skip cycle to avoid spam")
         return
 
     for thread in threads:
@@ -239,18 +266,16 @@ def process_inbox(cl: Client, replied: set) -> None:
             msg_id = str(last.id)
             thread_id = str(thread.id)
 
-            # ONLY respond if the OTHER person sent the newest message
-            if last_uid == my_id:
+            # ONLY if the other person sent the newest message
+            if last_uid == MY_USER_ID:
                 continue
 
             if not getattr(last, "text", None):
                 continue
 
-            # Already handled this exact message
             if msg_id in replied or msg_id in _in_flight:
                 continue
 
-            # Already handled this message id for this thread
             if _thread_last_handled.get(thread_id) == msg_id:
                 continue
 
@@ -258,7 +283,6 @@ def process_inbox(cl: Client, replied: set) -> None:
             if not text:
                 continue
 
-            # Lock BEFORE any network call so parallel polls can't double-send
             _in_flight.add(msg_id)
             replied.add(msg_id)
             _thread_last_handled[thread_id] = msg_id
@@ -274,7 +298,7 @@ def process_inbox(cl: Client, replied: set) -> None:
             print(f"AI reply: {reply[:120]}")
 
             cl.direct_send(reply, thread_ids=[int(thread.id)])
-            print("Reply sent (one message only — waiting for next user message)")
+            print("Reply sent (one only — waiting for next user message)")
             time.sleep(4)
 
         except Exception as e:
@@ -310,7 +334,7 @@ def main() -> None:
     while True:
         try:
             process_inbox(cl, replied)
-            _status.update({"ok": True, "msg": "running", "user_id": cl.user_id})
+            _status.update({"ok": True, "msg": "running", "user_id": MY_USER_ID})
         except LoginRequired:
             try:
                 cl = login_client()
