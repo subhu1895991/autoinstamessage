@@ -24,6 +24,8 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "12"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 IG_SESSION_JSON = os.getenv("IG_SESSION_JSON", "").strip()
+# If true, never attempt password login (use on Render)
+SESSION_ONLY = os.getenv("SESSION_ONLY", "1").strip() in ("1", "true", "True", "yes")
 
 SESSION_FILE = Path("session.json")
 REPLIED_FILE = Path("replied.json")
@@ -36,8 +38,6 @@ SYSTEM_PROMPT = (
 )
 
 groq_client = Groq(api_key=GROQ_API_KEY)
-
-# In-memory lock so the same message is never handled twice in one process
 _in_flight: set = set()
 
 
@@ -55,49 +55,75 @@ def save_replied(replied: set) -> None:
     REPLIED_FILE.write_text(json.dumps(items), encoding="utf-8")
 
 
-def ensure_session_file() -> None:
-    if not IG_SESSION_JSON:
-        return
-    try:
-        raw = base64.b64decode(IG_SESSION_JSON).decode("utf-8")
-        json.loads(raw)
-        SESSION_FILE.write_text(raw, encoding="utf-8")
-        print("Loaded session from IG_SESSION_JSON env")
-    except Exception as e:
-        print(f"Failed to load IG_SESSION_JSON: {e}")
+def ensure_session_file() -> bool:
+    """Write session.json from env. Returns True if session file exists after."""
+    if IG_SESSION_JSON:
+        try:
+            raw = base64.b64decode(IG_SESSION_JSON).decode("utf-8")
+            data = json.loads(raw)
+            SESSION_FILE.write_text(json.dumps(data), encoding="utf-8")
+            print("Loaded session from IG_SESSION_JSON env")
+            return True
+        except Exception as e:
+            print(f"Failed to decode IG_SESSION_JSON: {e}")
+            return False
+    return SESSION_FILE.exists()
 
 
 def login_client() -> Client:
-    ensure_session_file()
+    has_session = ensure_session_file()
     cl = Client()
     cl.delay_range = [2, 5]
 
-    if SESSION_FILE.exists():
+    if has_session and SESSION_FILE.exists():
         try:
             cl.load_settings(SESSION_FILE)
             cl.username = IG_USERNAME
-            cl.get_timeline_feed()
-            print("Logged in with saved session (no password login)")
+
+            # Prefer sessionid login (no password, less likely to 429)
+            sessionid = None
+            try:
+                settings = cl.get_settings()
+                cookies = settings.get("cookies") or {}
+                sessionid = cookies.get("sessionid")
+            except Exception:
+                pass
+
+            if sessionid:
+                cl.login_by_sessionid(sessionid)
+                print("Logged in with sessionid (no password)")
+            else:
+                # Settings already loaded; try a light call
+                cl.get_timeline_feed()
+                print("Logged in with saved settings")
+
             return cl
         except Exception as e:
-            print(f"Saved session invalid ({e})")
-            if not IG_PASSWORD:
+            print(f"Session login failed: {e}")
+            if SESSION_ONLY or not IG_PASSWORD:
                 raise RuntimeError(
-                    "Session expired. Make a new session.json on your PC "
-                    "and update IG_SESSION_JSON on Render."
+                    "Session invalid/expired. On your PC run the bot once to create "
+                    "a fresh session.json, Base64 it, and update IG_SESSION_JSON on Render."
                 )
-            print("Trying password login...")
+
+    if SESSION_ONLY:
+        raise RuntimeError(
+            "SESSION_ONLY=1 and no working session. "
+            "Do not password-login from Render (gets 429). "
+            "Refresh IG_SESSION_JSON from your PC."
+        )
 
     if not IG_PASSWORD:
-        raise RuntimeError("No valid session and IG_PASSWORD is empty")
+        raise RuntimeError("No session and no IG_PASSWORD")
 
+    print("WARNING: password login (may get 429 on cloud IPs)...")
     try:
         cl.login(IG_USERNAME, IG_PASSWORD)
     except TwoFactorRequired:
-        print("2FA enabled — disable it on the secondary account.")
+        print("2FA enabled — disable on secondary account.")
         raise
     except ChallengeRequired:
-        print("Challenge required — approve on your phone.")
+        print("Challenge required — approve on phone.")
         raise
 
     cl.dump_settings(SESSION_FILE)
@@ -117,7 +143,6 @@ def generate_reply(history: list, latest: str) -> str:
         max_tokens=120,
     )
     text = (completion.choices[0].message.content or "").strip()
-    # Keep only the first paragraph / first 2 sentences worth
     if "\n" in text:
         text = text.split("\n")[0].strip()
     return text or "Hey!"
@@ -155,9 +180,8 @@ def process_inbox(cl: Client, replied: set) -> None:
             if not thread.messages:
                 continue
 
-            last = thread.messages[0]  # newest message
+            last = thread.messages[0]
 
-            # ONLY reply if the other person sent the latest message
             if last.user_id == my_id:
                 continue
 
@@ -165,8 +189,6 @@ def process_inbox(cl: Client, replied: set) -> None:
                 continue
 
             msg_id = str(last.id)
-
-            # Already replied to this exact message (disk or memory)
             if msg_id in replied or msg_id in _in_flight:
                 continue
 
@@ -174,7 +196,6 @@ def process_inbox(cl: Client, replied: set) -> None:
             if not text:
                 continue
 
-            # Lock immediately so the next poll cannot double-send
             _in_flight.add(msg_id)
             replied.add(msg_id)
             save_replied(replied)
@@ -182,7 +203,6 @@ def process_inbox(cl: Client, replied: set) -> None:
             print(f"New message in thread {thread.id}: {text[:80]}")
 
             history = get_thread_history(cl, str(thread.id))
-            # Drop the last user message from history; we pass it as `latest`
             if history and history[-1]["role"] == "user":
                 history = history[:-1]
 
@@ -191,7 +211,6 @@ def process_inbox(cl: Client, replied: set) -> None:
 
             cl.direct_send(reply, thread_ids=[int(thread.id)])
             print("Reply sent (one message only)")
-
             time.sleep(3)
 
         except Exception as e:
@@ -202,8 +221,8 @@ def process_inbox(cl: Client, replied: set) -> None:
 def main() -> None:
     print("Starting Instagram AI bot...")
     print(f"Account: {IG_USERNAME}")
-    print(f"Poll every {POLL_INTERVAL}s | History: {MAX_HISTORY}")
-    print(f"Model: {GROQ_MODEL}")
+    print(f"Poll every {POLL_INTERVAL}s | Model: {GROQ_MODEL}")
+    print(f"SESSION_ONLY={SESSION_ONLY} | has IG_SESSION_JSON={bool(IG_SESSION_JSON)}")
     print("Rule: ONE reply per incoming message from the other person only")
 
     replied = load_replied()
@@ -216,6 +235,7 @@ def main() -> None:
             cl = login_client()
         except Exception as e:
             print(f"Loop error: {e}")
+            time.sleep(30)
 
         time.sleep(POLL_INTERVAL)
 
