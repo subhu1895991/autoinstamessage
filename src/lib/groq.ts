@@ -1,10 +1,6 @@
 import Groq from "groq-sdk";
 import type { ChatMessage } from "./store";
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
 const DEFAULT_SYSTEM = `You are a helpful, friendly Instagram assistant for this account.
 Keep replies short, natural and conversational (1-3 sentences usually).
 Do not mention that you are an AI unless asked.
@@ -14,6 +10,15 @@ export async function generateReply(
   history: ChatMessage[],
   latestUserMessage: string
 ): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY?.trim();
+
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY is not set");
+  }
+
+  // Create the client at request time, not during Next.js build/import.
+  const groq = new Groq({ apiKey });
+
   const systemPrompt =
     process.env.SYSTEM_PROMPT?.trim() || DEFAULT_SYSTEM;
 
