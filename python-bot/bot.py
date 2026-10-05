@@ -23,11 +23,13 @@ IG_USERNAME = os.environ["IG_USERNAME"]
 IG_PASSWORD = os.getenv("IG_PASSWORD", "")
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "12"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 IG_SESSION_JSON = os.getenv("IG_SESSION_JSON", "").strip()
 SESSION_ONLY = os.getenv("SESSION_ONLY", "1").strip() in ("1", "true", "True", "yes")
 PORT = int(os.getenv("PORT", "10000"))
+# After we reply in a thread, ignore that thread until a NEWER user message arrives
+# (tracked by last replied message id)
 
 SESSION_FILE = Path("session.json")
 REPLIED_FILE = Path("replied.json")
@@ -42,6 +44,8 @@ SYSTEM_PROMPT = (
 groq_client = Groq(api_key=GROQ_API_KEY)
 _in_flight: set = set()
 _status = {"ok": False, "msg": "starting"}
+# thread_id -> last message id we already handled
+_thread_last_handled: dict = {}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -54,7 +58,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        return  # silence access logs
+        return
 
 
 def start_health_server() -> None:
@@ -73,8 +77,11 @@ def load_replied() -> set:
 
 
 def save_replied(replied: set) -> None:
-    items = list(replied)[-3000:]
-    REPLIED_FILE.write_text(json.dumps(items), encoding="utf-8")
+    items = list(replied)[-5000:]
+    try:
+        REPLIED_FILE.write_text(json.dumps(items), encoding="utf-8")
+    except Exception as e:
+        print(f"Could not save replied.json: {e}")
 
 
 def ensure_session_file() -> bool:
@@ -101,13 +108,24 @@ def login_client() -> Client:
             cl.load_settings(SESSION_FILE)
             cl.username = IG_USERNAME
 
-            sessionid = None
+            settings = {}
             try:
-                settings = cl.get_settings()
-                cookies = settings.get("cookies") or {}
-                sessionid = cookies.get("sessionid")
+                settings = cl.get_settings() or {}
             except Exception:
                 pass
+
+            # Critical: set user_id so we can detect our own messages
+            uid = settings.get("ds_user_id") or settings.get("user_id")
+            if not uid:
+                auth = settings.get("authorization_data") or {}
+                uid = auth.get("ds_user_id")
+            if uid:
+                cl.user_id = int(uid)
+                print(f"Set user_id from session: {cl.user_id}")
+
+            sessionid = None
+            cookies = settings.get("cookies") or {}
+            sessionid = cookies.get("sessionid")
 
             if sessionid:
                 cl.login_by_sessionid(sessionid)
@@ -116,7 +134,19 @@ def login_client() -> Client:
                 cl.get_timeline_feed()
                 print("Logged in with saved settings")
 
-            _status.update({"ok": True, "msg": "logged_in"})
+            # Re-read user_id after login if still missing
+            if not cl.user_id:
+                try:
+                    info = cl.account_info()
+                    cl.user_id = int(info.pk)
+                    print(f"Set user_id from account_info: {cl.user_id}")
+                except Exception as e:
+                    print(f"Could not get account_info: {e}")
+
+            if not cl.user_id:
+                raise RuntimeError("user_id is missing — cannot safely detect own messages")
+
+            _status.update({"ok": True, "msg": "logged_in", "user_id": cl.user_id})
             return cl
         except Exception as e:
             print(f"Session login failed: {e}")
@@ -148,7 +178,7 @@ def login_client() -> Client:
 
     cl.dump_settings(SESSION_FILE)
     print("Fresh login successful, session saved")
-    _status.update({"ok": True, "msg": "logged_in_password"})
+    _status.update({"ok": True, "msg": "logged_in_password", "user_id": cl.user_id})
     return cl
 
 
@@ -161,7 +191,7 @@ def generate_reply(history: list, latest: str) -> str:
         model=GROQ_MODEL,
         messages=messages,
         temperature=0.7,
-        max_tokens=120,
+        max_tokens=100,
     )
     text = (completion.choices[0].message.content or "").strip()
     if "\n" in text:
@@ -176,7 +206,7 @@ def get_thread_history(cl: Client, thread_id: str) -> list:
         for m in reversed(thread.messages or []):
             if not m.text:
                 continue
-            role = "assistant" if m.user_id == cl.user_id else "user"
+            role = "assistant" if str(m.user_id) == str(cl.user_id) else "user"
             messages.append({"role": role, "content": m.text})
         return messages
     except Exception as e:
@@ -186,7 +216,7 @@ def get_thread_history(cl: Client, thread_id: str) -> list:
 
 def process_inbox(cl: Client, replied: set) -> None:
     try:
-        threads = cl.direct_threads(amount=15)
+        threads = cl.direct_threads(amount=10)
     except LoginRequired:
         print("Login required again...")
         raise
@@ -194,7 +224,10 @@ def process_inbox(cl: Client, replied: set) -> None:
         print(f"Error fetching threads: {e}")
         return
 
-    my_id = cl.user_id
+    my_id = str(cl.user_id)
+    if not my_id or my_id == "None":
+        print("ERROR: my_id is invalid — skipping cycle to avoid spam")
+        return
 
     for thread in threads:
         try:
@@ -202,28 +235,38 @@ def process_inbox(cl: Client, replied: set) -> None:
                 continue
 
             last = thread.messages[0]
+            last_uid = str(getattr(last, "user_id", ""))
+            msg_id = str(last.id)
+            thread_id = str(thread.id)
 
-            if last.user_id == my_id:
+            # ONLY respond if the OTHER person sent the newest message
+            if last_uid == my_id:
                 continue
 
             if not getattr(last, "text", None):
                 continue
 
-            msg_id = str(last.id)
+            # Already handled this exact message
             if msg_id in replied or msg_id in _in_flight:
+                continue
+
+            # Already handled this message id for this thread
+            if _thread_last_handled.get(thread_id) == msg_id:
                 continue
 
             text = last.text.strip()
             if not text:
                 continue
 
+            # Lock BEFORE any network call so parallel polls can't double-send
             _in_flight.add(msg_id)
             replied.add(msg_id)
+            _thread_last_handled[thread_id] = msg_id
             save_replied(replied)
 
-            print(f"New message in thread {thread.id}: {text[:80]}")
+            print(f"New USER message in thread {thread_id} from {last_uid}: {text[:80]}")
 
-            history = get_thread_history(cl, str(thread.id))
+            history = get_thread_history(cl, thread_id)
             if history and history[-1]["role"] == "user":
                 history = history[:-1]
 
@@ -231,8 +274,8 @@ def process_inbox(cl: Client, replied: set) -> None:
             print(f"AI reply: {reply[:120]}")
 
             cl.direct_send(reply, thread_ids=[int(thread.id)])
-            print("Reply sent (one message only)")
-            time.sleep(3)
+            print("Reply sent (one message only — waiting for next user message)")
+            time.sleep(4)
 
         except Exception as e:
             print(f"Error handling thread {getattr(thread, 'id', '?')}: {e}")
@@ -240,7 +283,6 @@ def process_inbox(cl: Client, replied: set) -> None:
 
 
 def main() -> None:
-    # Health server so Render Web Service detects an open port
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
 
@@ -248,7 +290,7 @@ def main() -> None:
     print(f"Account: {IG_USERNAME}")
     print(f"Poll every {POLL_INTERVAL}s | Model: {GROQ_MODEL}")
     print(f"SESSION_ONLY={SESSION_ONLY} | has IG_SESSION_JSON={bool(IG_SESSION_JSON)}")
-    print("Rule: ONE reply per incoming message from the other person only")
+    print("Rule: ONE reply only when the OTHER person sends a new message")
 
     replied = load_replied()
 
@@ -257,7 +299,6 @@ def main() -> None:
     except Exception as e:
         print(f"Login failed: {e}")
         _status.update({"ok": False, "msg": str(e)})
-        # Keep health server alive so logs are visible; retry later
         while True:
             time.sleep(60)
             try:
@@ -269,7 +310,7 @@ def main() -> None:
     while True:
         try:
             process_inbox(cl, replied)
-            _status.update({"ok": True, "msg": "running"})
+            _status.update({"ok": True, "msg": "running", "user_id": cl.user_id})
         except LoginRequired:
             try:
                 cl = login_client()
