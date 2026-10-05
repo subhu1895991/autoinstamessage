@@ -1,11 +1,7 @@
 """
 Unofficial Instagram DM auto-replier using instagrapi + Groq.
 
-WARNING
--------
-This violates Instagram Terms of Service.
-Your account can be locked or permanently banned.
-Use ONLY a secondary / throwaway account.
+WARNING: Violates Instagram ToS. Use a secondary account only.
 """
 
 import base64
@@ -22,24 +18,27 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, TwoFactorReq
 load_dotenv()
 
 IG_USERNAME = os.environ["IG_USERNAME"]
-IG_PASSWORD = os.getenv("IG_PASSWORD", "")  # optional on Render if session is provided
+IG_PASSWORD = os.getenv("IG_PASSWORD", "")
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "8"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "12"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
-# Base64 of session.json contents (for Render)
 IG_SESSION_JSON = os.getenv("IG_SESSION_JSON", "").strip()
 
 SESSION_FILE = Path("session.json")
 REPLIED_FILE = Path("replied.json")
 
 SYSTEM_PROMPT = (
-    "You are a friendly Instagram assistant. "
-    "Keep replies short and natural (1-3 sentences). "
+    "You are a friendly Instagram assistant chatting in DMs. "
+    "Reply with ONE short natural message only (1-2 sentences). "
+    "Do not ask multiple questions. Do not send lists. "
     "Do not mention that you are an AI unless asked."
 )
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# In-memory lock so the same message is never handled twice in one process
+_in_flight: set = set()
 
 
 def load_replied() -> set:
@@ -52,17 +51,15 @@ def load_replied() -> set:
 
 
 def save_replied(replied: set) -> None:
-    items = list(replied)[-2000:]
+    items = list(replied)[-3000:]
     REPLIED_FILE.write_text(json.dumps(items), encoding="utf-8")
 
 
 def ensure_session_file() -> None:
-    """If IG_SESSION_JSON is set, write it to session.json."""
     if not IG_SESSION_JSON:
         return
     try:
         raw = base64.b64decode(IG_SESSION_JSON).decode("utf-8")
-        # validate json
         json.loads(raw)
         SESSION_FILE.write_text(raw, encoding="utf-8")
         print("Loaded session from IG_SESSION_JSON env")
@@ -73,13 +70,11 @@ def ensure_session_file() -> None:
 def login_client() -> Client:
     ensure_session_file()
     cl = Client()
-    cl.delay_range = [1, 3]
+    cl.delay_range = [2, 5]
 
-    # 1) Try existing session without forcing a full password login from cloud IP
     if SESSION_FILE.exists():
         try:
             cl.load_settings(SESSION_FILE)
-            # set username so library knows who we are
             cl.username = IG_USERNAME
             cl.get_timeline_feed()
             print("Logged in with saved session (no password login)")
@@ -88,8 +83,8 @@ def login_client() -> Client:
             print(f"Saved session invalid ({e})")
             if not IG_PASSWORD:
                 raise RuntimeError(
-                    "Session expired and IG_PASSWORD is not set. "
-                    "Generate a new session.json on your PC and update IG_SESSION_JSON."
+                    "Session expired. Make a new session.json on your PC "
+                    "and update IG_SESSION_JSON on Render."
                 )
             print("Trying password login...")
 
@@ -99,10 +94,10 @@ def login_client() -> Client:
     try:
         cl.login(IG_USERNAME, IG_PASSWORD)
     except TwoFactorRequired:
-        print("2FA is enabled. Disable 2FA on the secondary account.")
+        print("2FA enabled — disable it on the secondary account.")
         raise
     except ChallengeRequired:
-        print("Instagram challenge required. Approve on your phone.")
+        print("Challenge required — approve on your phone.")
         raise
 
     cl.dump_settings(SESSION_FILE)
@@ -119,9 +114,13 @@ def generate_reply(history: list, latest: str) -> str:
         model=GROQ_MODEL,
         messages=messages,
         temperature=0.7,
-        max_tokens=250,
+        max_tokens=120,
     )
-    return (completion.choices[0].message.content or "").strip() or "Hey!"
+    text = (completion.choices[0].message.content or "").strip()
+    # Keep only the first paragraph / first 2 sentences worth
+    if "\n" in text:
+        text = text.split("\n")[0].strip()
+    return text or "Hey!"
 
 
 def get_thread_history(cl: Client, thread_id: str) -> list:
@@ -141,9 +140,9 @@ def get_thread_history(cl: Client, thread_id: str) -> list:
 
 def process_inbox(cl: Client, replied: set) -> None:
     try:
-        threads = cl.direct_threads(amount=20)
+        threads = cl.direct_threads(amount=15)
     except LoginRequired:
-        print("Login required again, re-authenticating...")
+        print("Login required again...")
         raise
     except Exception as e:
         print(f"Error fetching threads: {e}")
@@ -156,40 +155,44 @@ def process_inbox(cl: Client, replied: set) -> None:
             if not thread.messages:
                 continue
 
-            last = thread.messages[0]
+            last = thread.messages[0]  # newest message
 
+            # ONLY reply if the other person sent the latest message
             if last.user_id == my_id:
                 continue
 
-            if not last.text:
+            if not getattr(last, "text", None):
                 continue
 
             msg_id = str(last.id)
-            if msg_id in replied:
+
+            # Already replied to this exact message (disk or memory)
+            if msg_id in replied or msg_id in _in_flight:
                 continue
 
             text = last.text.strip()
             if not text:
                 continue
 
+            # Lock immediately so the next poll cannot double-send
+            _in_flight.add(msg_id)
+            replied.add(msg_id)
+            save_replied(replied)
+
             print(f"New message in thread {thread.id}: {text[:80]}")
 
             history = get_thread_history(cl, str(thread.id))
-            history_without_last = (
-                history[:-1]
-                if history and history[-1]["role"] == "user"
-                else history
-            )
+            # Drop the last user message from history; we pass it as `latest`
+            if history and history[-1]["role"] == "user":
+                history = history[:-1]
 
-            reply = generate_reply(history_without_last, text)
-            print(f"AI reply: {reply[:100]}")
+            reply = generate_reply(history, text)
+            print(f"AI reply: {reply[:120]}")
 
             cl.direct_send(reply, thread_ids=[int(thread.id)])
-            replied.add(msg_id)
-            save_replied(replied)
-            print("Reply sent")
+            print("Reply sent (one message only)")
 
-            time.sleep(2)
+            time.sleep(3)
 
         except Exception as e:
             print(f"Error handling thread {getattr(thread, 'id', '?')}: {e}")
@@ -199,8 +202,9 @@ def process_inbox(cl: Client, replied: set) -> None:
 def main() -> None:
     print("Starting Instagram AI bot...")
     print(f"Account: {IG_USERNAME}")
-    print(f"Poll every {POLL_INTERVAL}s | History: {MAX_HISTORY} messages")
+    print(f"Poll every {POLL_INTERVAL}s | History: {MAX_HISTORY}")
     print(f"Model: {GROQ_MODEL}")
+    print("Rule: ONE reply per incoming message from the other person only")
 
     replied = load_replied()
     cl = login_client()
