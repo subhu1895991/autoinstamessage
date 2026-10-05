@@ -7,7 +7,9 @@ WARNING: Violates Instagram ToS. Use a secondary account only.
 import base64
 import json
 import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,8 +26,8 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "12"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 IG_SESSION_JSON = os.getenv("IG_SESSION_JSON", "").strip()
-# If true, never attempt password login (use on Render)
 SESSION_ONLY = os.getenv("SESSION_ONLY", "1").strip() in ("1", "true", "True", "yes")
+PORT = int(os.getenv("PORT", "10000"))
 
 SESSION_FILE = Path("session.json")
 REPLIED_FILE = Path("replied.json")
@@ -39,6 +41,26 @@ SYSTEM_PROMPT = (
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 _in_flight: set = set()
+_status = {"ok": False, "msg": "starting"}
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps(_status).encode("utf-8")
+        self.send_response(200 if _status.get("ok") else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return  # silence access logs
+
+
+def start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Health server on port {PORT}")
+    server.serve_forever()
 
 
 def load_replied() -> set:
@@ -56,7 +78,6 @@ def save_replied(replied: set) -> None:
 
 
 def ensure_session_file() -> bool:
-    """Write session.json from env. Returns True if session file exists after."""
     if IG_SESSION_JSON:
         try:
             raw = base64.b64decode(IG_SESSION_JSON).decode("utf-8")
@@ -80,7 +101,6 @@ def login_client() -> Client:
             cl.load_settings(SESSION_FILE)
             cl.username = IG_USERNAME
 
-            # Prefer sessionid login (no password, less likely to 429)
             sessionid = None
             try:
                 settings = cl.get_settings()
@@ -93,24 +113,24 @@ def login_client() -> Client:
                 cl.login_by_sessionid(sessionid)
                 print("Logged in with sessionid (no password)")
             else:
-                # Settings already loaded; try a light call
                 cl.get_timeline_feed()
                 print("Logged in with saved settings")
 
+            _status.update({"ok": True, "msg": "logged_in"})
             return cl
         except Exception as e:
             print(f"Session login failed: {e}")
+            _status.update({"ok": False, "msg": f"session_failed: {e}"})
             if SESSION_ONLY or not IG_PASSWORD:
                 raise RuntimeError(
-                    "Session invalid/expired. On your PC run the bot once to create "
-                    "a fresh session.json, Base64 it, and update IG_SESSION_JSON on Render."
+                    "Session invalid/expired. Refresh session.json on PC and "
+                    "update IG_SESSION_JSON on Render."
                 )
 
     if SESSION_ONLY:
         raise RuntimeError(
             "SESSION_ONLY=1 and no working session. "
-            "Do not password-login from Render (gets 429). "
-            "Refresh IG_SESSION_JSON from your PC."
+            "Do not password-login from Render (gets 429)."
         )
 
     if not IG_PASSWORD:
@@ -128,6 +148,7 @@ def login_client() -> Client:
 
     cl.dump_settings(SESSION_FILE)
     print("Fresh login successful, session saved")
+    _status.update({"ok": True, "msg": "logged_in_password"})
     return cl
 
 
@@ -219,6 +240,10 @@ def process_inbox(cl: Client, replied: set) -> None:
 
 
 def main() -> None:
+    # Health server so Render Web Service detects an open port
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
+
     print("Starting Instagram AI bot...")
     print(f"Account: {IG_USERNAME}")
     print(f"Poll every {POLL_INTERVAL}s | Model: {GROQ_MODEL}")
@@ -226,13 +251,31 @@ def main() -> None:
     print("Rule: ONE reply per incoming message from the other person only")
 
     replied = load_replied()
-    cl = login_client()
+
+    try:
+        cl = login_client()
+    except Exception as e:
+        print(f"Login failed: {e}")
+        _status.update({"ok": False, "msg": str(e)})
+        # Keep health server alive so logs are visible; retry later
+        while True:
+            time.sleep(60)
+            try:
+                cl = login_client()
+                break
+            except Exception as e2:
+                print(f"Retry login failed: {e2}")
 
     while True:
         try:
             process_inbox(cl, replied)
+            _status.update({"ok": True, "msg": "running"})
         except LoginRequired:
-            cl = login_client()
+            try:
+                cl = login_client()
+            except Exception as e:
+                print(f"Re-login failed: {e}")
+                time.sleep(60)
         except Exception as e:
             print(f"Loop error: {e}")
             time.sleep(30)
